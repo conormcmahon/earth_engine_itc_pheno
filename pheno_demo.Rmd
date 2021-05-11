@@ -1,0 +1,207 @@
+---
+title: "Pheno Demo"
+author: "Conor McMahon"
+date: "5/4/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(janitor)
+library(here)
+library(lubridate)
+library(RcppRoll)
+
+```
+
+This is to illustrate the differences in leaf phenology across species in the Desert SW of the United States.
+
+
+```{r, message=FALSE, warnings=FALSE}
+
+ndvi <- read_csv(here::here("data","san_pedro_ndvi.csv")) %>%
+  janitor::clean_names()
+
+print(paste("The number of Populus freemontii polygons is ", nrow(ndvi %>% filter(level_2=="PopFre")), sep=""))
+print(paste("The number of Salix gooddinggii polygons is ", (nrow(ndvi %>% filter(level_2=="SalGoo"))),sep=""))
+print(paste("The number of Tamarix ramossisima polygons is ", nrow(ndvi %>% filter(level_2 %in% c("TamRaC","TamRac"))),sep=""))
+
+# Get Latitude from GEO Column
+longitude_regex <- regexpr("[-.0-9]+\\.[0-9]+",ndvi$geo)
+latitude_regex <- regexpr(",[-.0-9]+\\.[0-9]+",ndvi$geo)
+ndvi$longitude <- substr(ndvi$geo,longitude_regex, longitude_regex+attr(longitude_regex,"match.length")-1)
+ndvi$latitude <- substr(ndvi$geo,latitude_regex+1, latitude_regex+attr(latitude_regex,"match.length")-1)
+ndvi$longitude <- as.numeric(ndvi$longitude)
+ndvi$latitude <- as.numeric(ndvi$latitude)
+
+date_columns <- grep("x.*nd", names(ndvi))
+ndvi_longer <- ndvi %>%
+  pivot_longer(date_columns, 
+               names_to="raster_name",
+               values_to="ndvi") %>%
+  mutate(year=substr(raster_name,2,5),
+         month=substr(raster_name,6,7),
+         day=substr(raster_name,8,9)) %>%
+  mutate(day_of_year=lubridate::yday(as.Date(paste(year,month,day,sep="-"))))
+
+ndvi_stats <- ndvi_longer %>%
+  filter(level_2 %in% c("PopFre","ProVel","Pinus","PlaRac")) %>%
+  group_by(level_2, day_of_year) %>%
+  summarize(ndvi=mean(ndvi, na.rm=TRUE)) %>%
+  drop_na(ndvi) %>%
+  mutate(ndvi_smooth=roll_mean(ndvi,10,align="right",fill=0)) %>%
+  filter(ndvi_smooth > 0)
+species_stats <- ndvi_stats %>% 
+    filter(day_of_year < 70) %>%
+    group_by(level_2) %>%
+    summarize(early_ndvi = mean(ndvi, na.rm=TRUE),
+              early_ndvi_sd = sd(ndvi, na.rm=TRUE))
+ndvi_stats$ndvi_smooth_norm <- (ndvi_stats$ndvi_smooth - species_stats[match(ndvi_stats$level_2, species_stats$level_2),]$early_ndvi)
+
+
+ggplot(ndvi_stats %>% drop_na(ndvi_smooth_norm)) + 
+  geom_line(aes(x=day_of_year, y=ndvi_smooth_norm, group=level_2, col=level_2)) + 
+  ggtitle("Leaf Phenology of Riparian Trees") + 
+  xlab("Day Of year") + 
+  ylab("Greenness (NDVI)")
+
+
+```
+
+The above plot shows differences in leaf phenology across several species characteristic of riparian zones in SW Arizona. *Populus freemontii* greens up noticeably earlier in the season than does *Prosopis velutina* up on the floodplains, further away from the channel. In mountain canyons, *Platanus wrightii* leafs out relatively later as well, around the same time as *Prosopis velutina*. By contrast, the various *Pinus* spp. are evergreen and don't change much in greenness over the year. 
+
+Next we look a bit at differences in greenup time by location. Three field sites were surveyed along an approximately 50 km North-South transect on the San Pedro River. 
+
+```{r}
+
+
+# Cluster POPULUS FREEMONTII values by Site (Latitude)
+san_pedro_trees <- ndvi_longer %>% filter(level_2 %in% c("PopFre"))
+clusters <- kmeans(san_pedro_trees$latitude, 3)
+san_pedro_trees$cluster <- clusters$cluster
+san_pedro_stats <- san_pedro_trees %>%
+    group_by(cluster, level_2, day_of_year) %>%
+    summarize(ndvi=mean(ndvi, na.rm=TRUE),
+              latitude=mean(latitude, na.rm=TRUE)) %>%
+    drop_na(ndvi) %>%
+    mutate(ndvi_smooth=roll_mean(ndvi,15,align="right",fill=0)) %>%
+    filter(ndvi_smooth > 0)
+# Sort Clusters by Latitude
+cluster_order <- (sort(clusters$centers,index.return=TRUE))$ix
+san_pedro_stats$site <- as.numeric(match(san_pedro_stats$cluster,cluster_order))
+san_pedro_stats$latitude <- factor(round(san_pedro_stats$latitude,3))
+site_stats <- san_pedro_stats %>% 
+    filter(day_of_year < 70) %>%
+    group_by(site) %>%
+    summarize(early_ndvi = mean(ndvi, na.rm=TRUE),
+              early_ndvi_sd = sd(ndvi, na.rm=TRUE))
+san_pedro_stats$ndvi_smooth_norm <- (san_pedro_stats$ndvi_smooth - site_stats[san_pedro_stats$site,2])[[1]]
+
+ggplot(san_pedro_stats %>% drop_na(ndvi_smooth)) + 
+    geom_line(aes(x=day_of_year, y=ndvi_smooth, group=latitude, col=latitude), size=1.5) + 
+    ggtitle("Leaf Flush Date of Cottonwoods by Latitude") + 
+    scale_x_continuous(limits=c(50,150)) +
+    scale_color_manual(name="Latitude",
+                       values=c("purple","cyan3","pink")) + 
+    xlab("Day Of year") + 
+    ylab("Greenness (NDVI)")
+
+# Cluster PROSOPIS VELUTINA values by Site (Latitude)
+san_pedro_trees <- ndvi_longer %>% filter(level_2 %in% c("ProVel"))
+clusters <- kmeans(san_pedro_trees$latitude, 3)
+san_pedro_trees$cluster <- clusters$cluster
+san_pedro_stats <- san_pedro_trees %>%
+  group_by(cluster, level_2, day_of_year) %>%
+  summarize(ndvi=mean(ndvi, na.rm=TRUE),
+            latitude=mean(latitude, na.rm=TRUE)) %>%
+  drop_na(ndvi) %>%
+  mutate(ndvi_smooth=roll_mean(ndvi,10,align="right",fill=0)) %>%
+  filter(ndvi_smooth > 0)
+# Sort Clusters by Latitude
+cluster_order <- (sort(clusters$centers,index.return=TRUE))$ix
+san_pedro_stats$site <- as.numeric(match(san_pedro_stats$cluster,cluster_order))
+san_pedro_stats$latitude <- factor(round(san_pedro_stats$latitude,3))
+site_stats <- san_pedro_stats %>% 
+  filter(day_of_year < 100) %>%
+  group_by(site) %>%
+  summarize(early_ndvi = mean(ndvi, na.rm=TRUE),
+            early_ndvi_sd = sd(ndvi, na.rm=TRUE))
+san_pedro_stats$ndvi_smooth_norm <- (san_pedro_stats$ndvi_smooth - site_stats[san_pedro_stats$site,2])[[1]]
+
+ggplot(san_pedro_stats %>% drop_na(ndvi_smooth_norm)) + 
+    geom_line(aes(x=day_of_year, y=ndvi_smooth_norm, group=latitude, col=latitude), size=1.5) + 
+    ggtitle("Leaf Flush Date of Mesquite by Latitude") + 
+    scale_x_continuous(limits=c(50,200)) +
+    scale_color_manual(name="Latitude",
+                 values=c("purple","cyan3","pink")) + 
+    xlab("Day Of year") + 
+    ylab("Greenness (NDVI)")
+
+
+```
+
+The above plots show difference in leaf flush date by site for both cottonwoods (*Populus freemontii*) and mesquite (*Prosopis velutina*). For cottonwoods, further south sites start greening up earlier in the season than do further north sites. It also appears that northern sites may green more slowly than southern sites. The differences are less noticeable for mesquite. 
+
+
+
+Next up are Californian riparian trees. Another comparison of greenness across species: 
+
+
+```{r, message=FALSE, warnings=FALSE}
+
+ndvi <- read_csv(here::here("data","baron_refugio_ndvi.csv")) %>%
+  janitor::clean_names()
+
+print(paste("The number of Platanus racemosa polygons is ", nrow(ndvi %>% filter(level_2=="PlaRac")), sep=""))
+print(paste("The number of Salix polygons is ", nrow(ndvi %>% filter(level_2 %in% c("SalLae","SalLas"))), sep=""))
+print(paste("The number of Populus trichocarpa polygons is ", nrow(ndvi %>% filter(level_2=="PopTri")), sep=""))
+print(paste("The number of Quercus agrifolia polygons is ", nrow(ndvi %>% filter(level_2=="QueAgr")), sep=""))
+
+# Get Latitude from GEO Column
+longitude_regex <- regexpr("[-.0-9]+\\.[0-9]+",ndvi$geo)
+latitude_regex <- regexpr(",[-.0-9]+\\.[0-9]+",ndvi$geo)
+ndvi$longitude <- substr(ndvi$geo,longitude_regex, longitude_regex+attr(longitude_regex,"match.length")-1)
+ndvi$latitude <- substr(ndvi$geo,latitude_regex+1, latitude_regex+attr(latitude_regex,"match.length")-1)
+ndvi$longitude <- as.numeric(ndvi$longitude)
+ndvi$latitude <- as.numeric(ndvi$latitude)
+
+date_columns <- grep("x.*nd", names(ndvi))
+ndvi_longer <- ndvi %>%
+  pivot_longer(date_columns, 
+               names_to="raster_name",
+               values_to="ndvi") %>%
+  mutate(year=substr(raster_name,2,5),
+         month=substr(raster_name,6,7),
+         day=substr(raster_name,8,9)) %>%
+  mutate(day_of_year=lubridate::yday(as.Date(paste(year,month,day,sep="-"))))
+
+ndvi_longer[ndvi_longer$level_2=="SalLae",]$level_2 = "Salix"
+ndvi_longer[ndvi_longer$level_2=="SalLas",]$level_2 = "Salix"
+
+ndvi_stats <- ndvi_longer %>%
+  filter(level_2 %in% c("PlaRac","PopTri","Salix","QueAgr")) %>%
+  group_by(level_2, day_of_year) %>%
+  summarize(ndvi=mean(ndvi, na.rm=TRUE)) %>%
+  drop_na(ndvi) %>%
+  mutate(ndvi_smooth=roll_mean(ndvi,10,align="right",fill=0)) %>%
+  filter(ndvi_smooth > 0)
+species_stats <- ndvi_stats %>% 
+    filter(day_of_year < 70) %>%
+    group_by(level_2) %>%
+    summarize(early_ndvi = mean(ndvi, na.rm=TRUE),
+              early_ndvi_sd = sd(ndvi, na.rm=TRUE))
+#species_stats[species_stats$level_2=="QueAgr",]$early_ndvi = 0 # prevent offset for evergreen spp. 
+ndvi_stats$ndvi_smooth_norm <- (ndvi_stats$ndvi_smooth - species_stats[match(ndvi_stats$level_2, species_stats$level_2),]$early_ndvi)
+
+
+ggplot(ndvi_stats %>% drop_na(ndvi_smooth_norm)) + 
+  geom_line(aes(x=day_of_year, y=ndvi_smooth_norm, group=level_2, col=level_2)) + 
+  ggtitle("Leaf Phenology of Riparian Trees") + 
+  xlab("Day Of year") + 
+  ylab("Greenness (NDVI)") + 
+  scale_x_continuous(limits=c(0,365)) 
+
+
+```
