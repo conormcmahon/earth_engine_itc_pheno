@@ -1,0 +1,256 @@
+---
+title: "Pheno Demo Santa Barbara"
+author: "Conor McMahon"
+date: "5/4/2021"
+output: html_document
+---
+
+TODO
+- add automatic delineation of deciduous vs. evergreen trees
+- support for chaparral, annual grass, other phenologies? 
+- detection of weird outliers like burned areas, tree mortality, etc?
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(janitor)
+library(here)
+library(lubridate)
+library(RcppRoll)
+
+```
+
+First, we'll check out phenology curves for Vandenberg's various important plants. We'll look at Willow (*Salix lasiolepis* and *Salix laevigata*), Cottonwood (*Populus trichocarpa*), Cottonwood (*Populus trichocarpa*), and a few tall, nonnative, evergreen trees (*Eucalyptus globulus* and *Cupressus* sp.).
+
+
+```{r, message=FALSE, warnings=FALSE}
+
+ndvi <- read_csv(here::here("data","baron_refugio_ndvi.csv")) %>%
+  janitor::clean_names() %>%
+  filter(!is.na(level_2))
+ndvi[ndvi$level_2 %in% c("PlaRac", "Platanus", "PlaWri"),]$level_2 = "Platanus"
+ndvi[ndvi$level_2 %in% c("SalLas","SalLae", "Salix", "SalGoo"),]$level_2 = "Salix"
+ndvi[ndvi$level_2=="PopTri",]$level_2 = "Populus"
+ndvi[ndvi$level_2 %in% c("EucGlo","EucCup","Cupressus"),]$level_2 = "Nonnative Evergreen"
+ndvi[ndvi$level_2 %in% c("Quercus","QueAgr"),]$level_2 = "Quercus"
+
+print(paste("The number of Salix sp. polygons is ", nrow(ndvi %>% filter(level_2=="Salix")), sep=""))
+print(paste("The number of Populus trichocarpa polygons is ", (nrow(ndvi %>% filter(level_2=="Populus"))),sep=""))
+print(paste("The number of Quercus sp. polygons is ", nrow(ndvi %>% filter(level_2=="Quercus")),sep=""))
+print(paste("The number of nonnative Eucalyptus sp. or Cupressus sp. polygons is ", nrow(ndvi %>% filter(level_2=="Nonnative Evergreen")),sep=""))
+
+# Get Latitude from GEO Column
+longitude_regex <- regexpr("[-.0-9]+\\.[0-9]+",ndvi$geo)
+latitude_regex <- regexpr(",[-.0-9]+\\.[0-9]+",ndvi$geo)
+ndvi$longitude <- substr(ndvi$geo,longitude_regex, longitude_regex+attr(longitude_regex,"match.length")-1)
+ndvi$latitude <- substr(ndvi$geo,latitude_regex+1, latitude_regex+attr(latitude_regex,"match.length")-1)
+ndvi$longitude <- as.numeric(ndvi$longitude)
+ndvi$latitude <- as.numeric(ndvi$latitude)
+
+date_columns <- grep("x.*nd", names(ndvi))
+ndvi_longer <- ndvi %>%
+  pivot_longer(date_columns, 
+               names_to="raster_name",
+               values_to="ndvi") %>%
+  mutate(year=substr(raster_name,2,5),
+         month=substr(raster_name,6,7),
+         day=substr(raster_name,8,9)) %>%
+  mutate(day_of_year=lubridate::yday(as.Date(paste(year,month,day,sep="-"))))
+
+ndvi_stats <- ndvi_longer %>%
+  filter(level_2 %in% c("Salix","Populus","Platanus","Quercus","Nonnative Evergreen")) %>%
+  group_by(level_2, day_of_year) %>%
+  summarize(ndvi=mean(ndvi, na.rm=TRUE)) %>%
+  drop_na(ndvi) %>%
+  mutate(ndvi_smooth=roll_mean(ndvi,10,align="right",fill=0)) %>%
+  filter(ndvi_smooth > 0)
+species_stats <- ndvi_stats %>% 
+    filter(day_of_year < 70) %>%
+    group_by(level_2) %>%
+    summarize(early_ndvi = mean(ndvi, na.rm=TRUE),
+              early_ndvi_sd = sd(ndvi, na.rm=TRUE))
+ndvi_stats$ndvi_smooth_norm <- (ndvi_stats$ndvi_smooth - species_stats[match(ndvi_stats$level_2, species_stats$level_2),]$early_ndvi)
+
+
+ggplot(ndvi_stats %>% drop_na(ndvi_smooth)) + 
+  geom_line(aes(x=day_of_year, y=ndvi_smooth, col=level_2)) + 
+  geom_point(aes(x=day_of_year, y=ndvi, col=level_2)) + 
+  facet_wrap(~level_2) +
+  ggtitle("Leaf Phenology of Riparian Trees") + 
+  xlab("Day Of year") + 
+  ylab("Greenness (NDVI)") + 
+  theme(legend.position = "none")
+
+
+# Get Convex Hull around the points (X=Day, Y=NDVI)
+species_data <- ndvi_stats %>%
+  filter(level_2 == "Salix")
+convex_hull_indices <- chull(species_data$day_of_year,
+                             species_data$ndvi)
+convex_hull <- rbind(species_data[convex_hull_indices,]$day_of_year,
+                     species_data[convex_hull_indices,]$ndvi)
+num_hull_points <- ncol(convex_hull)
+# Flip order of convex hull (force to run clockwise) 
+convex_hull[,c(num_hull_points:1)]
+# Find the earliest point in the timeseries
+first_day_index <- which(convex_hull[1,] == min(convex_hull[1,]))
+# Pivot matrix so it starts at the earliest point
+if(first_day_index > 1)
+{
+  convex_hull <- cbind(convex_hull[,first_day_index:num_hull_points],
+                       convex_hull[,1:(first_day_index-1)])
+}
+# Remove all points after latest date (bottom half of hull)
+last_day_index <- which(convex_hull[1,] == max(convex_hull[1,]))
+upper_hull <- convex_hull[,1:last_day_index]
+# Plot upper convex hull on top of points
+plot(species_data$day_of_year, species_data$ndvi)
+points(upper_hull[1,], upper_hull[2,], type='l')
+# Iterate through hull segments, finding distance from points to hull 
+species_data$obs_index <- 1:nrow(species_data)
+species_data$ndvi_dist <- rep(0,nrow(species_data))
+for(hull_ind in 1:(length(convex_hull[1,])-1))
+{
+  # Get points below current hull segment
+  min_day <- convex_hull[1,hull_ind]
+  max_day <- convex_hull[1,hull_ind+1]
+  left_ndvi <- convex_hull[2,hull_ind]
+  right_ndvi <- convex_hull[2,hull_ind+1]
+  current_points <- species_data %>%
+    filter(day_of_year > min_day,
+           day_of_year < max_day) %>%
+    mutate(ndvi_deficit = left_ndvi + (right_ndvi-left_ndvi)*(day_of_year-min_day)/(max_day-min_day) - ndvi)
+  species_data[current_points$obs_index,]$ndvi_dist = current_points$ndvi_deficit
+}
+dist_sd <- sd(species_data$ndvi_dist)
+species_data$ndvi_dist_z <- species_data$ndvi_dist/dist_sd
+
+hull_df <- data_frame(day_of_year = upper_hull[1,],
+                      ndvi = upper_hull[2,])
+
+ggplot() + 
+  geom_point(data=species_data, aes(x=day_of_year, y=ndvi, col=(ndvi_dist_z>1))) + 
+  geom_line(data=hull_df, aes(x=day_of_year, y=ndvi)) + 
+  ggtitle("Outlier Rejection") + 
+  xlab("Day Of year") + 
+  ylab("Greenness (NDVI)") + 
+  theme(legend.position = "none") + 
+  labs(caption = "Outlier rejection for NDVI phenology curve in Salix sp. on Vandenberg. Blue points are at least 1.0 standard deviation below the upper hull.")
+ggplot() + 
+  geom_point(data=species_data, aes(x=day_of_year, y=ndvi, col=(ndvi_dist_z>0.5))) + 
+  geom_line(data=hull_df, aes(x=day_of_year, y=ndvi)) + 
+  ggtitle("Outlier Rejection") + 
+  xlab("Day Of year") + 
+  ylab("Greenness (NDVI)") + 
+  theme(legend.position = "none") + 
+  labs(caption = "Outlier rejection for NDVI phenology curve in Salix sp. on Vandenberg. Colored points are at least 0.5 standard deviation below the upper hull.")
+  
+
+# RANSAC to find three periods (leaf flush, growing season, and fall senescence)
+#   Model based on two inflection points: end of leaf flush, and start of fall senescence
+set.seed(7)
+z_threshold <- 1.5
+
+phenology_ransac <- function(data)
+{
+  points <- sample(1:365, 2, replace=FALSE)
+  spring_end <- min(points)
+  fall_start <- max(points)
+  
+  spring <- species_data %>%
+    filter(ndvi_dist_z < z_threshold) %>%
+    filter(day_of_year <= spring_end)
+  summer <- species_data %>%
+    filter(ndvi_dist_z < z_threshold) %>%
+    filter(day_of_year > spring_end,
+           day_of_year <= fall_start)
+  fall <- species_data %>%
+    filter(ndvi_dist_z < z_threshold) %>%
+    filter(day_of_year > fall_start)
+  # Check for degenerate case with too few points in one region for regression
+  if(nrow(spring) < 2 ||
+     nrow(summer) < 2 ||
+     nrow(fall) < 2)
+  {
+    results <- data.frame(spring_end =       spring_end,
+                                 fall_start =       fall_start,
+                                 rmse =             100000,
+                                 spring_slope =     0,
+                                 spring_intercept = 0,
+                                 summer_slope =     0,
+                                 summer_intercept = 0,
+                                 fall_slope =       0,
+                                 fall_intercept =   0)
+  }
+  else
+  {
+    spring_model <- lm(data=spring, ndvi~day_of_year)
+    summer_model <- lm(data=summer, ndvi~day_of_year)
+    fall_model <- lm(data=fall, ndvi~day_of_year)
+
+    root_mean_square_residual <- sqrt((sum((spring_model$residuals)^2) +
+                                       sum((summer_model$residuals)^2) +
+                                       sum((fall_model$residuals)^2))/nrow(data))
+
+    results <- data.frame(spring_end =       spring_end,
+                                 fall_start =       fall_start,
+                                 rmse =             root_mean_square_residual,
+                                 spring_slope =     spring_model$coefficients[2],
+                                 spring_intercept = spring_model$coefficients[1],
+                                 summer_slope =     summer_model$coefficients[2],
+                                 summer_intercept = summer_model$coefficients[1],
+                                 fall_slope =       fall_model$coefficients[2],
+                                 fall_intercept =   fall_model$coefficients[1])
+  }
+
+  return(results)
+}
+
+ransac_results <- data.frame(spring_end =       numeric(),
+                             fall_start =       numeric(),
+                             rmse =             numeric(),
+                             spring_slope =     numeric(),
+                             spring_intercept = numeric(),
+                             summer_slope =     numeric(),
+                             summer_intercept = numeric(),
+                             fall_slope =       numeric(),
+                             fall_intercept =   numeric())
+for(run in 1:1000)
+{
+  ransac_results <- rbind(ransac_results,
+                          phenology_ransac(species_data))
+}
+# Sort in ascending order of model error
+ransac_results <- ransac_results %>%
+  arrange(rmse)
+
+
+ggplot() + 
+    geom_point(data=species_data, aes(x=day_of_year, y=ndvi, col=(ndvi_dist_z>z_threshold))) + 
+    geom_abline(intercept=ransac_results[1,]$spring_intercept, slope=ransac_results[1,]$spring_slope) + 
+    geom_abline(intercept=ransac_results[1,]$summer_intercept, slope=ransac_results[1,]$summer_slope) + 
+    geom_abline(intercept=ransac_results[1,]$fall_intercept, slope=ransac_results[1,]$fall_slope) + 
+    ggtitle("RANSAC Regression") + 
+    xlab("Day Of year") + 
+    ylab("Greenness (NDVI)") + 
+    theme(legend.position = "none") + 
+    labs(caption = "Outlier rejection for NDVI phenology curve in Salix sp. on Vandenberg. Colored points are at least 0.5 standard deviation below the upper hull.")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
